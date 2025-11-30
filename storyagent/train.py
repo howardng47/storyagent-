@@ -1,107 +1,93 @@
-# train_qwen_lora.py
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Any
 
-import torch
 from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     DataCollatorForLanguageModeling,
-    Trainer,
     TrainingArguments,
+    Trainer,
 )
 from peft import LoraConfig, get_peft_model
 
+# ========= 配置 =========
 
-MODEL_NAME = "Qwen/Qwen1.5-0.5B-Chat"  # 小模型
+MODEL_NAME = "Qwen/Qwen1.5-0.5B-Chat"  # 千问 0.5B 聊天模型
 DATA_PATH = "data/mystery_town_qwen_train.jsonl"
-OUTPUT_DIR = "qwen0_5b_mystery_lora"
+OUTPUT_DIR = "qwen_mysterytown_lora"
 
-
-@dataclass
-class QwenDetectiveExample:
-    prompt: str
-    answer: str
-
-
-def load_train_dataset() -> Any:
-    """
-    从 jsonl 加载数据，其中每行包含 'prompt' 和 'answer'
-    """
-    dataset = load_dataset("json", data_files=DATA_PATH, split="train")
-    return dataset
+MAX_SEQ_LEN = 512
 
 
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("Using device:", device)
-
+    # 1. 加载 tokenizer 和模型
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=False)
-    # Qwen1.5 一般有 chat 模式，这里简单用纯文本格式来做 SFT：
-    EOS = tokenizer.eos_token or "<|endoftext|>"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    raw_dataset = load_train_dataset()
-
-    max_length = 512  # 对话很长可以适当裁剪，先保守一些
-
-    def format_example(example: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        把一条样本变成：<prompt>\n答案：<answer>
-        再做统一的 tokenization。
-        """
-        prompt = example["prompt"]
-        answer = example["answer"].strip()
-        text = f"{prompt}\n答案：{answer}{EOS}"
-
-        tokenized = tokenizer(
-            text,
-            max_length=max_length,
-            truncation=True,
-        )
-        # 语言模型监督微调：labels 就是 input_ids 的 copy
-        tokenized["labels"] = tokenized["input_ids"].copy()
-        return tokenized
-
-    tokenized_dataset = raw_dataset.map(format_example, remove_columns=raw_dataset.column_names)
-
-    # 加载 Qwen 模型（0.5B），不做量化也能跑，显存压力不大
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto",
+        device_map="auto",          # 自动放到 GPU
+        torch_dtype="auto",
     )
 
-    # 配置 LoRA
-    # 注意：target_modules 需要根据实际模型结构调整，这里给一个典型示例，
-    # 如果报错，可以通过打印 model.named_modules() 来进一步筛选。
+    # 2. 配置 LoRA（只调注意力矩阵 q/k/v，比较省显存）
     lora_config = LoraConfig(
         r=8,
         lora_alpha=16,
         lora_dropout=0.05,
         bias="none",
+        target_modules=["q_proj", "k_proj", "v_proj"],
         task_type="CAUSAL_LM",
-        target_modules=["c_attn", "c_proj", "w1", "w2", "w3"],  # 示例，必要时需调整
     )
-
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
+
+    # 3. 加载数据集
+    dataset = load_dataset("json", data_files=DATA_PATH)["train"]
+
+    def format_example(example):
+        # 把 prompt + 答案串成一条文本，让模型学习“看到推理过程 -> 输出凶手ID”
+        text = example["prompt"].strip()
+        answer = example["answer"].strip()
+
+        # 简单格式：问答式
+        full_text = (
+            text
+            + "\n答案："
+            + answer
+            + tokenizer.eos_token
+        )
+
+        tokenized = tokenizer(
+            full_text,
+            max_length=MAX_SEQ_LEN,
+            truncation=True,
+        )
+        tokenized["labels"] = tokenized["input_ids"].copy()
+        return tokenized
+
+    tokenized_ds = dataset.map(
+        format_example,
+        remove_columns=dataset.column_names,
+    )
 
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=False,
     )
 
+    # 4. 训练参数（可以根据显存调整 batch_size 和 gradient_accumulation_steps）
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
-        num_train_epochs=3,
-        per_device_train_batch_size=4,
+        per_device_train_batch_size=2,
         gradient_accumulation_steps=4,
-        learning_rate=5e-5,
-        fp16=torch.cuda.is_available(),
+        num_train_epochs=3,
+        learning_rate=2e-4,
+        fp16=True,
         logging_steps=10,
-        save_steps=100,
+        save_strategy="epoch",
         save_total_limit=2,
         remove_unused_columns=False,
         report_to=[],
@@ -110,17 +96,15 @@ def main():
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=tokenized_dataset,
-        eval_dataset=None,
+        train_dataset=tokenized_ds,
         data_collator=data_collator,
     )
 
     trainer.train()
 
-    # 保存 LoRA 权重 + tokenizer
-    trainer.save_model(OUTPUT_DIR)
+    # 5. 只保存 LoRA 权重（体积很小）
+    model.save_pretrained(OUTPUT_DIR)
     tokenizer.save_pretrained(OUTPUT_DIR)
-    print(f"模型已保存到 {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":
