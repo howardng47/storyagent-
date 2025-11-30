@@ -6,7 +6,7 @@ from typing import List, Dict, Any
 
 from dotenv import load_dotenv
 from openai import OpenAI
-
+import requests
 # ========= 环境变量 & OpenAI 客户端 =========
 
 # 从 .env 文件加载环境变量
@@ -42,6 +42,44 @@ def call_llm(system_prompt,
 
     resp = client.chat.completions.create(**kwargs)
     return resp.choices[0].message.content
+
+def serpapi_search_snippets(query: str, num_results: int = 3) -> str:
+    """
+    使用 SerpAPI 调用 Google 搜索，返回若干条精简的搜索摘要，
+    用于增强背景和角色发言。
+    """
+    api_key = os.environ.get("SERPAPI_API_KEY")
+    if not api_key:
+        # 如果没配置 key，就直接返回空字符串，不影响主流程
+        return ""
+
+    params = {
+        "engine": "google",
+        "q": query,
+        "api_key": api_key,
+        "hl": "zh-cn",
+        "num": num_results,
+    }
+
+    try:
+        resp = requests.get("https://serpapi.com/search.json", params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print("SerpAPI 搜索调用失败：", e)
+        return ""
+
+    snippets = []
+    # SerpAPI 把普通结果放在 organic_results 里
+    for item in data.get("organic_results", [])[:num_results]:
+        title = item.get("title", "")
+        snippet = item.get("snippet", "")
+        link = item.get("link", "")
+        if not (title or snippet):
+            continue
+        snippets.append(f"标题：{title}\n摘要：{snippet}\n链接：{link}")
+
+    return "\n\n".join(snippets)
 
 
 def safe_json_loads(resp_text: str):
@@ -83,6 +121,22 @@ class GameState:
     killer_name: str
     max_rounds: int
     logs: List[Dict[str, str]] = field(default_factory=list)  # [{"role": "...", "text": "..."}]
+    search_context: str = ""
+
+def get_char_name(game_state: GameState, role_id: str) -> str:
+    """根据角色ID拿中文名字，拿不到就退回ID本身。"""
+    role_info = game_state.roles.get(role_id, {})
+    return role_info.get("name", role_id)
+
+
+def build_history_text(game_state: GameState) -> str:
+    """把 logs 里的 ID 全部换成中文姓名，生成给模型看的对话历史。"""
+    lines = []
+    for log in game_state.logs:
+        role_id = log["role"]
+        char_name = get_char_name(game_state, role_id)
+        lines.append(f"{char_name}: {log['text']}")
+    return "\n".join(lines)
 
 
 class GameMaster:
@@ -103,8 +157,16 @@ class GameMaster:
         )
 
     def create_game(self) -> GameState:
+        search_snippets = serpapi_search_snippets(
+            "小镇 谋杀案 典型动机 人物关系 小镇生活 证词",
+            num_results=3
+        )
+
         user_prompt = (
             "请根据上述要求，设计一局发生在“推理小镇”的谋杀案推理游戏。\n"
+            "你可以参考以下来自真实世界的背景资料（不要照搬原文，可以改写、融合）：\n"
+            "【网络搜索参考信息】：\n"
+            f"{search_snippets}\n\n"
             "严格按照指定的 JSON 结构输出，不要添加多余字段。"
         )
 
@@ -124,6 +186,7 @@ class GameMaster:
             roles=game_json["roles"],
             killer_name=game_json["killer_name"],
             max_rounds=int(game_json["max_rounds"]),
+            search_context=search_snippets,
         )
 
 
@@ -151,17 +214,21 @@ class KillerAgent(BaseAgent):
             % (char_name, role_info["public_info"], role_info["secret_info"])
         )
 
-        history = "\n".join(["%s: %s" % (log["role"], log["text"]) for log in game_state.logs])
+        history = build_history_text(game_state)
+
         user_prompt = (
-            "【案情背景】%s\n\n"
-            "【当前对话记录】\n%s\n\n"
-            "现在轮到你（%s）发言，请以“%s”的口吻说话。"
-            % (game_state.background, history, char_name, char_name)
+            f"【案情背景】\n{game_state.background}\n\n"
+            "【现实世界参考信息】（可以用来增加生活细节和职业细节，不要直接照抄）：\n"
+            f"{game_state.search_context}\n\n"
+            "【当前对话记录】\n"
+            f"{history}\n\n"
+            f"现在轮到你（{char_name}）发言，请以“{char_name}”的口吻说话，"
+            "结合自身身份与可能的生活细节，自然地说出一段话。"
         )
 
-        return call_llm(system_prompt, user_prompt, model_name=self.model_name,
+        return call_llm(system_prompt, user_prompt,
+                        model_name=self.model_name,
                         temperature=0.9, max_tokens=120)
-
 
 class DetectiveAgent(BaseAgent):
     def act(self, game_state: GameState) -> str:
@@ -176,32 +243,58 @@ class DetectiveAgent(BaseAgent):
             % (char_name, role_info["public_info"], role_info["secret_info"])
         )
 
-        history = "\n".join(["%s: %s" % (log["role"], log["text"]) for log in game_state.logs])
+        # 使用带中文姓名的对话历史
+        history = build_history_text(game_state)
+
         user_prompt = (
-            "【案情背景】%s\n\n"
-            "【当前对话记录】\n%s\n\n"
-            "现在轮到你（%s）发言，请结合已有线索，发表一段话（质问、怀疑或推理）。"
-            % (game_state.background, history, char_name)
+            f"【案情背景】\n{game_state.background}\n\n"
+            "【现实世界参考信息】（包括小镇生活、典型谋杀案动机等，可用作推理参考，不要直接照抄）：\n"
+            f"{game_state.search_context}\n\n"
+            "【当前对话记录】\n"
+            f"{history}\n\n"
+            f"现在轮到你（{char_name}）发言，请结合已有线索和现实常识，"
+            "提出尖锐问题或阶段性推理，发言不超过100字。"
         )
 
-        return call_llm(system_prompt, user_prompt, model_name=self.model_name,
-                        temperature=0.7, max_tokens=150)
+        return call_llm(
+            system_prompt,
+            user_prompt,
+            model_name=self.model_name,
+            temperature=0.7,
+            max_tokens=150,
+        )
 
     def final_guess(self, game_state: GameState) -> str:
-        """最后一轮：给出凶手猜测（只输出角色名即可）"""
-        history = "\n".join([f"{log['role']}: {log['text']}" for log in game_state.logs])
+        """最后一轮：给出凶手猜测（只输出中文姓名）。"""
+        history = build_history_text(game_state)
+
+        # 构造一个角色列表，帮助模型对上“谁是谁”
+        roles_str = "\n".join([
+            f"{info.get('name', role_id)}（角色ID：{role_id}）"
+            for role_id, info in game_state.roles.items()
+        ])
+
         system_prompt = (
-            "你是推理小镇中的侦探，现在游戏即将结束。"
-            "请根据对话记录判断谁是凶手，"
-            "只输出一个角色名（例如 'killer'、'npc0' 等），不要输出其他任何文字。"
+            "你是推理小镇中的侦探，现在游戏即将结束。\n"
+            "下面给出每个角色的ID和对应的中文姓名。\n"
+            "请根据对话记录判断谁是凶手，只输出你认为的凶手的中文姓名，"
+            "不要输出角色ID或其他任何文字。"
         )
+
         user_prompt = (
-            f"【背景】{game_state.background}\n"
-            f"【对话记录】\n{history}\n"
-            "请只给出你认为的凶手的角色名。"
+            f"【背景】{game_state.background}\n\n"
+            f"【角色列表】\n{roles_str}\n\n"
+            f"【对话记录】\n{history}\n\n"
+            "请只给出你认为的凶手的中文姓名。"
         )
-        guess = call_llm(system_prompt, user_prompt, model_name=self.model_name,
-                         temperature=0.0, max_tokens=10)
+
+        guess = call_llm(
+            system_prompt,
+            user_prompt,
+            model_name=self.model_name,
+            temperature=0.0,
+            max_tokens=10,
+        )
         return guess.strip()
 
 
@@ -230,16 +323,26 @@ class NPCAgent(BaseAgent):
 
         system_prompt = base + bias
 
-        history = "\n".join(["%s: %s" % (log["role"], log["text"]) for log in game_state.logs])
+        # 使用带中文姓名的对话历史
+        history = build_history_text(game_state)
+
         user_prompt = (
-            "【案情背景】%s\n\n"
-            "【当前对话记录】\n%s\n\n"
-            "现在轮到你（%s）发言，请自然地说出你此刻会讲的话。"
-            % (game_state.background, history, char_name)
+            f"【案情背景】\n{game_state.background}\n\n"
+            "【现实世界参考信息】（可以用来增加生活细节、职业习惯等，不要直接照抄）：\n"
+            f"{game_state.search_context}\n\n"
+            "【当前对话记录】\n"
+            f"{history}\n\n"
+            f"现在轮到你（{char_name}）发言，请以符合你身份的口吻，自然地说出此刻会讲的话，"
+            "可以适当加入生活细节或主观评价，但不要一次性透露所有真相。"
         )
 
-        return call_llm(system_prompt, user_prompt, model_name=self.model_name,
-                        temperature=0.9, max_tokens=120)
+        return call_llm(
+            system_prompt,
+            user_prompt,
+            model_name=self.model_name,
+            temperature=0.9,
+            max_tokens=120,
+        )
 
 
 # ===================== 运行多局游戏并生成数据集 =====================
@@ -290,37 +393,40 @@ def simulate_one_game(gm_model="gpt-4.1-mini"):
             role_info = game_state.roles[agent.name]
             char_name = role_info.get("name", agent.name)
 
-            print(f"{agent.name}（{char_name}）：{text}")
+            print(f"{char_name}：{text}")
 
     # 侦探最终推理
     detective_guess = detective_agent.final_guess(game_state)
 
+    # 真实凶手姓名（根据 killer_name 这个 ID 去 roles 里查）
+    true_killer_name = get_char_name(game_state, game_state.killer_name)
+
     print("\n========== 侦探最终推理结果 ==========")
-    print("侦探认为凶手是角色ID：", detective_guess)
-    print("真实凶手的角色ID：", game_state.killer_name)
+    print("侦探认为凶手是：", detective_guess)
+    print("真实凶手是：", true_killer_name)
+    print("(调试) 真实凶手角色ID：", game_state.killer_name)
+
     print("==========================================\n")
 
     dialogue_text = "\n".join(["%s: %s" % (log["role"], log["text"]) for log in game_state.logs])
     prompt = (
-        "背景：%s\n\n"
-        "以下是推理小镇中各个角色围绕案件的对话记录（角色ID在每行开头）：\n%s\n\n"
-        "问题：根据以上对话，谁是凶手？\n"
-        "请只回答角色ID（例如 'killer'、'npc0'、'npc1' 等）。"
-        % (game_state.background, dialogue_text)
+            "背景：%s\n\n"
+            "以下是推理小镇中各个角色围绕案件的对话记录（角色ID在每行开头）：\n%s\n\n"
+            "问题：根据以上对话，谁是凶手？\n"
+            "请只回答凶手的中文姓名。"
+            % (game_state.background, dialogue_text)
     )
-    answer = game_state.killer_name  # 官方真相中的角色ID
 
     return {
         "background": game_state.background,
         "roles": game_state.roles,
         "logs": game_state.logs,
-        "killer_name": game_state.killer_name,
+        "killer_role_id": game_state.killer_name,
+        "killer_name": true_killer_name,
         "detective_guess": detective_guess,
         "prompt": prompt,
-        "answer": answer,
+        "answer": true_killer_name,  # 用人名做训练标签
     }
-
-
 
 def main():
     os.makedirs("data", exist_ok=True)
